@@ -49,7 +49,7 @@ tr:nth-child(even){background:#fafafa}
 <div class="tip" id="tip">单位：亿元｜数据源：东方财富公开接口｜盘中为实时累计值，收盘后为当日最终值</div>
 
 <script>
-/* ===== JSONP（绕过跨域） ===== */
+/* ===== JSONP（用于 push2 接口，绕过跨域） ===== */
 function jsonp(url, timeout){
   timeout = timeout || 10000;
   return new Promise(function(resolve, reject){
@@ -72,56 +72,56 @@ function diff(cur, prev){
 }
 var yi = 100000000; // 元 → 亿元
 
-/* ===== 1. 实时成交额 ===== */
+/* ===== 1. 实时成交额（push2 接口，JSONP） ===== */
 async function loadRealtimeVolume(){
   var url = 'https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=1.000001,0.399106&fields=f6,f12,f14';
   var d = await jsonp(url);
   var arr = (d && d.data && d.data.diff) || [];
   var sh = null, sz = null;
   for(var i=0;i<arr.length;i++){
-    if(arr[i].f12 === '000001') sh = arr[i].f6;       // 上证指数成交额（全沪市）
-    if(arr[i].f12 === '399106') sz = arr[i].f6;       // 深证综指成交额（全深市）
+    if(arr[i].f12 === '000001') sh = arr[i].f6;
+    if(arr[i].f12 === '399106') sz = arr[i].f6;
   }
   return { sh:sh==null?null:sh/yi, sz:sz==null?null:sz/yi };
 }
 
-/* ===== 2. 成交额历史K线（修复：f56→f57，f57才是成交额） ===== */
+/* ===== 2. 成交额历史K线（push2his 接口，JSONP） ===== */
 async function loadVolumeHistory(secid){
   var url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + secid
-          + '&fields1=f1,f2,f3&fields2=f51,f57&klt=101&fqt=1&end=20500101&lmt=22';
+          + '&fields1=f1,f2,f3&fields2=f51,f57&klt=101&fqt=1&end=20500101&lmt=25';
   var d = await jsonp(url);
   var k = (d && d.data && d.data.klines) || [];
   var out = [];
   for(var i=0;i<k.length;i++){
     var p = String(k[i]).split(',');
-    out.push({ date: p[0], amt: parseFloat(p[1]) / yi });   // p[1] 现在是 f57 成交额（元）
+    out.push({ date: p[0], amt: parseFloat(p[1]) / yi });
   }
   return out; // 旧 → 新
 }
 
-/* ===== 3. 融资余额（修复：字段名大写 DIM_DATE / RZYE） ===== */
+/* ===== 3. 融资余额（datacenter 接口，fetch + CORS） ===== */
 async function loadMargin(){
   var url = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
           + '?reportName=RPTA_RZRQ_LSHJ'
-          + '&columns=ALL&source=WEB&sortColumns=dim_date&sortTypes=-1&pageSize=22&pageNumber=1';
-  var d = await jsonp(url);
+          + '&columns=SDATE,RZYE'
+          + '&source=WEB'
+          + '&sortColumns=SDATE'
+          + '&sortTypes=-1'
+          + '&pageSize=25'
+          + '&pageNumber=1';
+  var res = await fetch(url, { cache: 'no-cache' });
+  var d = await res.json();
   var rows = (d && d.result && d.result.data) || [];
   var out = [];
   for(var i=0;i<rows.length;i++){
     var r = rows[i];
-    // 尝试多种字段名写法
-    var date = r.DIM_DATE || r.dim_date || r.Date || r.date || '';
-    var v = r.RZYE != null ? r.RZYE
-         : r.rzye != null ? r.rzye
-         : r.RZYE_BZ != null ? r.RZYE_BZ
-         : r.rzye_bz != null ? r.rzye_bz : null;
+    var date = r.SDATE || r.sdate || '';
+    var v = r.RZYE != null ? r.RZYE : (r.rzye != null ? r.rzye : null);
     if(date && v != null){
-      var ds = String(date);
-      if(ds.length >= 10) ds = ds.slice(0, 10);
-      out.push({ date: ds, val: parseFloat(v) / yi });
+      out.push({ date: String(date), val: parseFloat(v) / yi });
     }
   }
-  return out; // 旧 → 新
+  return out; // 已经是新 → 旧（sortTypes=-1 降序）
 }
 
 /* ===== 渲染成交额 ===== */
@@ -140,7 +140,7 @@ function renderVolume(shHist, szHist, today){
     var last = rows[rows.length-1];
     if(last && last.date === t.date){ rows[rows.length-1] = t; } else { rows.push(t); }
   }
-  rows.reverse();
+  rows.reverse(); // 最新在最上
   var h = '';
   for(var i=0;i<rows.length;i++){
     var r = rows[i];
@@ -159,11 +159,11 @@ function renderMargin(list){
     document.getElementById('tbM').innerHTML = '<tr><td colspan="3" class="err">暂无数据（融资余额通常 T+1 更新）</td></tr>';
     return;
   }
-  var rows = list.slice().reverse();
+  // list 已经是新→旧，直接渲染
   var h = '';
-  for(var i=0;i<rows.length;i++){
-    var r = rows[i];
-    var prev = (i+1 < rows.length) ? rows[i+1].val : null;
+  for(var i=0;i<list.length;i++){
+    var r = list[i];
+    var prev = (i+1 < list.length) ? list[i+1].val : null;
     var df = diff(r.val, prev);
     h += '<tr><td>'+r.date+'</td><td><strong>'+fmt(r.val)+'</strong></td>'
        + '<td class="'+df.c+'">'+df.t+'</td></tr>';
@@ -174,7 +174,7 @@ function renderMargin(list){
 /* ===== 主流程 ===== */
 async function loadAll(){
   var tip = document.getElementById('tip'), errs = [];
-  // 成交额
+  // 成交额（JSONP）
   try{
     var shH = await loadVolumeHistory('1.000001');
     var szH = await loadVolumeHistory('0.399106');
@@ -188,7 +188,7 @@ async function loadAll(){
     errs.push('成交额获取失败');
     document.getElementById('tbV').innerHTML = '<tr><td colspan="5" class="err">获取失败，请点击刷新重试</td></tr>';
   }
-  // 融资余额
+  // 融资余额（fetch）
   try{
     var m = await loadMargin();
     renderMargin(m);
