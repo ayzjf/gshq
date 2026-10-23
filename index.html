@@ -22,16 +22,20 @@ tr:nth-child(even){background:#fafafa}
 .up{color:#e53935;font-weight:600}
 .down{color:#1e88e5;font-weight:600}
 .dash{color:#bbb}
-.tip{text-align:center;font-size:11px;color:#aaa;margin-top:12px;padding:6px}
+.tip{text-align:center;font-size:11px;color:#aaa;margin-top:12px;padding:6px;word-break:break-all}
 .err{color:#e53935}
 .loading{color:#999}
+#diag{background:#fff;border-radius:8px;padding:8px;margin-top:10px;font-size:11px;color:#666;display:none;word-break:break-all}
 @media(max-width:700px){.wrap{grid-template-columns:1fr}table{font-size:11px}th,td{padding:5px 2px}}
 </style>
 </head>
 <body>
 
 <h1>沪深两市成交额 & 融资余额</h1>
-<div class="bar">更新时间：<b id="ts">--</b> <button onclick="loadAll()">刷新</button></div>
+<div class="bar">更新时间：<b id="ts">--</b>
+  <button onclick="loadAll()">刷新</button>
+  <button onclick="selfTest()">自检</button>
+</div>
 
 <div class="wrap">
   <div class="card">
@@ -46,22 +50,24 @@ tr:nth-child(even){background:#fafafa}
   </div>
 </div>
 
-<div class="tip" id="tip">单位：亿元｜数据源：东方财富公开接口｜融资余额为 T+1 更新</div>
+<div class="tip" id="tip">单位：亿元｜融资余额 T+1 更新</div>
+<div id="diag"></div>
 
 <script>
-var yi = 100000000; // 元 → 亿元
+var yi = 100000000;
+var LOG = [];
+function log(s){ LOG.push(s); console.log('[行情]', s); }
 
-/* ---------- JSONP（push2 系列用 cb，datacenter 用 callback） ---------- */
+/* ---------- JSONP ---------- */
 function jsonp(url, cbName, timeout){
-  cbName = cbName || 'cb';
-  timeout = timeout || 10000;
+  cbName = cbName || 'cb'; timeout = timeout || 10000;
   return new Promise(function(resolve, reject){
     var name = '__c' + Date.now() + Math.floor(Math.random()*1e5);
     var s = document.createElement('script');
     var t = setTimeout(function(){ done(); reject(new Error('timeout')); }, timeout);
     function done(){ clearTimeout(t); try{delete window[name];}catch(e){window[name]=undefined;} s.remove(); }
     window[name] = function(d){ done(); resolve(d); };
-    s.onerror = function(){ done(); reject(new Error('load fail')); };
+    s.onerror = function(){ done(); reject(new Error('script load fail')); };
     s.src = url + (url.indexOf('?')>-1?'&':'?') + cbName + '=' + name;
     document.head.appendChild(s);
   });
@@ -74,140 +80,145 @@ function diff(cur, prev){
   return {t:(d>0?'+':'')+d.toLocaleString('zh-CN',{maximumFractionDigits:2}), c:d>0?'up':(d<0?'down':'dash')};
 }
 
-/* ---------- 1. 实时成交额 ---------- */
+/* ---------- 实时成交额 ---------- */
 async function loadRealtimeVolume(){
   var url = 'https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=1.000001,0.399106&fields=f6,f12,f14';
   var d = await jsonp(url, 'cb');
   var arr = (d && d.data && d.data.diff) || [];
-  var sh = null, sz = null;
+  var sh=null, sz=null;
   for(var i=0;i<arr.length;i++){
-    if(arr[i].f12 === '000001') sh = arr[i].f6;
-    if(arr[i].f12 === '399106') sz = arr[i].f6;
+    if(arr[i].f12==='000001') sh=arr[i].f6;
+    if(arr[i].f12==='399106') sz=arr[i].f6;
   }
   return { sh:sh==null?null:sh/yi, sz:sz==null?null:sz/yi };
 }
 
-/* ---------- 2. 成交额历史（f57 = 成交额） ---------- */
+/* ---------- 成交额历史（f57=成交额） ---------- */
 async function loadVolumeHistory(secid){
-  var url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + secid
+  var url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid='+secid
           + '&fields1=f1,f2,f3&fields2=f51,f57&klt=101&fqt=1&end=20500101&lmt=25';
   var d = await jsonp(url, 'cb');
   var k = (d && d.data && d.data.klines) || [];
-  var out = [];
-  for(var i=0;i<k.length;i++){
-    var p = String(k[i]).split(',');
-    out.push({ date: p[0], amt: parseFloat(p[1]) / yi });
-  }
-  return out; // 旧 → 新
+  var out=[];
+  for(var i=0;i<k.length;i++){ var p=String(k[i]).split(','); out.push({date:p[0], amt:parseFloat(p[1])/yi}); }
+  return out;
 }
 
-/* ---------- 3. 融资余额（修正字段名 DIM_DATE / RZYE，fetch + JSONP 双保险） ---------- */
+/* ---------- 融资余额：三级降级 ---------- */
 var MARGIN_URL = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
-               + '?reportName=RPTA_RZRQ_LSHJ'
-               + '&columns=DIM_DATE,RZYE'
-               + '&source=WEB'
-               + '&sortColumns=DIM_DATE'
-               + '&sortTypes=-1'
-               + '&pageSize=25'
-               + '&pageNumber=1';
+  + '?reportName=RPTA_RZRQ_LSHJ&columns=DIM_DATE,RZYE&source=WEB'
+  + '&sortColumns=DIM_DATE&sortTypes=-1&pageSize=25&pageNumber=1';
 
-function parseMarginRows(d){
+function parseMargin(d){
   var rows = (d && d.result && d.result.data) || [];
   var out = [];
   for(var i=0;i<rows.length;i++){
     var r = rows[i];
     var date = r.DIM_DATE || r.dim_date || '';
-    var v = (r.RZYE != null) ? r.RZYE : (r.rzye != null ? r.rzye : null);
-    if(date && v != null){
-      out.push({ date: String(date).slice(0,10), val: parseFloat(v) / yi });
-    }
+    var v = (r.RZYE!=null)?r.RZYE:(r.rzye!=null?r.rzye:null);
+    if(date && v!=null) out.push({date:String(date).slice(0,10), val:parseFloat(v)/yi});
   }
-  return out; // 新 → 旧
+  return out;
 }
 
 async function loadMargin(){
-  // 先 fetch
+  // 1) 直接 fetch
   try{
-    var res = await fetch(MARGIN_URL, { cache:'no-cache' });
+    var res = await fetch(MARGIN_URL, {cache:'no-cache'});
     var d = await res.json();
-    var out = parseMarginRows(d);
-    if(out.length) return out;
-  }catch(e){ /* 继续尝试 JSONP */ }
-  // 降级 JSONP（该接口支持 callback 参数）
-  var d2 = await jsonp(MARGIN_URL, 'callback', 10000);
-  return parseMarginRows(d2);
+    var out = parseMargin(d);
+    if(out.length){ log('融资余额：fetch 成功，'+out.length+' 条'); return out; }
+    log('融资余额：fetch 返回空，success='+(d&&d.success)+'，msg='+(d&&d.message));
+  }catch(e){ log('融资余额：fetch 失败 -> '+e.message); }
+
+  // 2) JSONP（该接口支持 callback 参数）
+  try{
+    var d2 = await jsonp(MARGIN_URL, 'callback', 10000);
+    var out2 = parseMargin(d2);
+    if(out2.length){ log('融资余额：JSONP 成功，'+out2.length+' 条'); return out2; }
+    log('融资余额：JSONP 返回空');
+  }catch(e){ log('融资余额：JSONP 失败 -> '+e.message); }
+
+  // 3) 公共 CORS 代理兜底
+  var proxies = [
+    'https://api.allorigins.win/raw?url=',
+    'https://corsproxy.io/?url='
+  ];
+  for(var i=0;i<proxies.length;i++){
+    try{
+      var r3 = await fetch(proxies[i] + encodeURIComponent(MARGIN_URL), {cache:'no-cache'});
+      var t3 = await r3.text();
+      var d3 = JSON.parse(t3);
+      var out3 = parseMargin(d3);
+      if(out3.length){ log('融资余额：代理'+(i+1)+' 成功，'+out3.length+' 条'); return out3; }
+    }catch(e){ log('融资余额：代理'+(i+1)+' 失败 -> '+e.message); }
+  }
+  throw new Error('三种方式均未取到数据');
 }
 
 /* ---------- 渲染 ---------- */
-function renderVolume(shHist, szHist, today){
-  var n = Math.max(shHist.length, szHist.length), rows = [];
+function renderVolume(shH, szH, today){
+  var n=Math.max(shH.length, szH.length), rows=[];
   for(var i=0;i<n;i++){
-    var sh = shHist[i] ? shHist[i].amt : null;
-    var sz = szHist[i] ? szHist[i].amt : null;
-    var date = (shHist[i] && shHist[i].date) || (szHist[i] && szHist[i].date) || '';
-    rows.push({ date: date, sh: sh, sz: sz, total: (sh!=null&&sz!=null)? sh+sz : null });
+    var sh=shH[i]?shH[i].amt:null, sz=szH[i]?szH[i].amt:null;
+    var date=(shH[i]&&shH[i].date)||(szH[i]&&szH[i].date)||'';
+    rows.push({date:date, sh:sh, sz:sz, total:(sh!=null&&sz!=null)?sh+sz:null});
   }
-  if(today && (today.sh!=null || today.sz!=null)){
-    var t = { date: today.date, sh: today.sh, sz: today.sz,
-              total: (today.sh!=null&&today.sz!=null)? today.sh+today.sz : null };
-    var last = rows[rows.length-1];
-    if(last && last.date === t.date){ rows[rows.length-1] = t; } else { rows.push(t); }
+  if(today && (today.sh!=null||today.sz!=null)){
+    var t={date:today.date, sh:today.sh, sz:today.sz, total:(today.sh!=null&&today.sz!=null)?today.sh+today.sz:null};
+    var last=rows[rows.length-1];
+    if(last && last.date===t.date) rows[rows.length-1]=t; else rows.push(t);
   }
   rows.reverse();
-  var h = '';
+  var h='';
   for(var i=0;i<rows.length;i++){
-    var r = rows[i];
-    var prev = (i+1 < rows.length) ? rows[i+1].total : null;
-    var df = diff(r.total, prev);
-    h += '<tr><td>'+r.date+'</td><td>'+fmt(r.sh)+'</td><td>'+fmt(r.sz)+'</td>'
-       + '<td><strong>'+fmt(r.total)+'</strong></td>'
-       + '<td class="'+df.c+'">'+df.t+'</td></tr>';
+    var r=rows[i], prev=(i+1<rows.length)?rows[i+1].total:null, df=diff(r.total, prev);
+    h+='<tr><td>'+r.date+'</td><td>'+fmt(r.sh)+'</td><td>'+fmt(r.sz)+'</td>'
+      +'<td><strong>'+fmt(r.total)+'</strong></td><td class="'+df.c+'">'+df.t+'</td></tr>';
   }
   document.getElementById('tbV').innerHTML = h || '<tr><td colspan="5" class="err">暂无数据</td></tr>';
 }
 
 function renderMargin(list){
   if(!list || !list.length){
-    document.getElementById('tbM').innerHTML = '<tr><td colspan="3" class="err">暂无数据</td></tr>';
-    return;
+    document.getElementById('tbM').innerHTML='<tr><td colspan="3" class="err">暂无数据</td></tr>'; return;
   }
-  var h = '';
+  var h='';
   for(var i=0;i<list.length;i++){
-    var r = list[i];
-    var prev = (i+1 < list.length) ? list[i+1].val : null;
-    var df = diff(r.val, prev);
-    h += '<tr><td>'+r.date+'</td><td><strong>'+fmt(r.val)+'</strong></td>'
-       + '<td class="'+df.c+'">'+df.t+'</td></tr>';
+    var r=list[i], prev=(i+1<list.length)?list[i+1].val:null, df=diff(r.val, prev);
+    h+='<tr><td>'+r.date+'</td><td><strong>'+fmt(r.val)+'</strong></td>'
+      +'<td class="'+df.c+'">'+df.t+'</td></tr>';
   }
-  document.getElementById('tbM').innerHTML = h;
+  document.getElementById('tbM').innerHTML=h;
 }
 
 /* ---------- 主流程 ---------- */
 async function loadAll(){
-  var tip = document.getElementById('tip'), errs = [];
+  LOG = [];
+  var tip=document.getElementById('tip'), errs=[];
   try{
-    var shH = await loadVolumeHistory('1.000001');
-    var szH = await loadVolumeHistory('0.399106');
-    var today = null;
-    try{
-      var q = await loadRealtimeVolume();
-      today = { date: new Date().toISOString().slice(0,10), sh: q.sh, sz: q.sz };
-    }catch(e){}
+    var shH=await loadVolumeHistory('1.000001');
+    var szH=await loadVolumeHistory('0.399106');
+    var today=null;
+    try{ var q=await loadRealtimeVolume(); today={date:new Date().toISOString().slice(0,10), sh:q.sh, sz:q.sz}; }catch(e){}
     renderVolume(shH, szH, today);
-  }catch(e){
-    errs.push('成交额获取失败');
-    document.getElementById('tbV').innerHTML = '<tr><td colspan="5" class="err">获取失败，请点击刷新重试</td></tr>';
-  }
-  try{
-    var m = await loadMargin();
-    renderMargin(m);
-  }catch(e){
-    errs.push('融资余额获取失败');
-    document.getElementById('tbM').innerHTML = '<tr><td colspan="3" class="err">获取失败，请点击刷新重试</td></tr>';
-  }
+  }catch(e){ errs.push('成交额失败:'+e.message);
+    document.getElementById('tbV').innerHTML='<tr><td colspan="5" class="err">获取失败</td></tr>'; }
+
+  try{ renderMargin(await loadMargin()); }
+  catch(e){ errs.push('融资余额失败:'+e.message);
+    document.getElementById('tbM').innerHTML='<tr><td colspan="3" class="err">获取失败</td></tr>'; }
+
   document.getElementById('ts').textContent = new Date().toLocaleString('zh-CN');
-  tip.textContent = errs.length ? ('提示：' + errs.join('；'))
-    : '单位：亿元｜数据源：东方财富公开接口｜融资余额 T+1 更新，盘中显示为上一交易日';
+  document.getElementById('tip').textContent = errs.length ? ('提示：'+errs.join('；')) : '单位：亿元｜融资余额 T+1 更新';
+}
+
+/* ---------- 自检：把失败原因直接显示在页面上 ---------- */
+async function selfTest(){
+  var box=document.getElementById('diag'); box.style.display='block'; box.textContent='自检中…';
+  LOG=[];
+  try{ await loadMargin(); }catch(e){ log('最终失败 -> '+e.message); }
+  box.innerHTML = '<b>自检日志</b><br>' + LOG.join('<br>');
 }
 
 loadAll();
